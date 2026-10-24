@@ -11,6 +11,7 @@ if (process.platform !== 'win32') throw new Error('Owned native broker smoke is 
 const binary = process.env.CROSSCHAT_PRODUCT_BROKER_FIXTURE || path.join(__dirname, '..', 'build', 'bin', 'native-host', 'ProductBrokerFixture.exe');
 if (!fs.existsSync(binary)) throw new Error('Build native helpers before running the owned fixture smoke');
 const forceNoFit = process.env.CROSSCHAT_FIXTURE_NO_FIT === '1';
+const layoutBoundary = process.env.CROSSCHAT_FIXTURE_LAYOUT_BOUNDARY || '';
 const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'crosschat-native-line-'));
 const nonce = crypto.randomBytes(24).toString('hex');
 let window, child, sequence = 0, output = '', settled = false, timer, closeRequestCount = 0;
@@ -73,9 +74,27 @@ async function run() {
             if ('hwnd' in layout.root || 'title' in layout.root || 'text' in layout.root) throw new Error('Geometry report contains disallowed metadata');
             return send('line-attach', { fixture: true });
           }).then(result => {
+            if (layoutBoundary) {
+              if (layoutBoundary === 'exact-fit') {
+                if (result.type !== 'line-attached' || result.attached !== true || result.alive !== true || result.layoutAdapted !== true) throw new Error(`Exact-fit owned layout failed: ${JSON.stringify(result)}`);
+                const observations = result.layoutObservations;
+                const last = observations?.at(-1), prior = observations?.at(-2);
+                if (!last || !prior || last.chat.width !== 364 || last.hub.width < hubMinimum.width || last.hub.left !== 0 || last.hub.left + last.hub.width !== last.chat.left || last.chat.left + last.chat.width !== last.paneWidth || last.paneWidth <= prior.paneWidth) throw new Error(`Exact-fit outer-rectangle expansion/readback failed: ${JSON.stringify({ prior, last })}`);
+                const root = result.root, workingArea = result.workingArea;
+                if (!root || !workingArea || root.left < workingArea.left || root.top < workingArea.top || root.left + root.width > workingArea.left + workingArea.width || root.top + root.height > workingArea.top + workingArea.height) throw new Error(`Expanded root escaped its working area: ${JSON.stringify({ root, workingArea })}`);
+              } else if (layoutBoundary === 'one-pixel-short') {
+                if (result.type !== 'line-attach-failed' || result.restored !== true || !/cannot fit within the selected display working area/.test(result.message)) throw new Error(`One-pixel-short layout was not rejected and restored: ${JSON.stringify(result)}`);
+              } else throw new Error(`Unknown fixture layout boundary mode: ${layoutBoundary}`);
+              return send('detach-host');
+            }
             if (result.type !== 'line-attached' || result.attached !== true || result.alive !== true) throw new Error(`Owned fixture attach/readback failed: ${JSON.stringify(result)}`);
             return send('line-hide');
           }).then(result => {
+            if (layoutBoundary) {
+              if (result.type !== 'host-detached' || result.restored !== true || result.lineAlive !== true) throw new Error(`Boundary fixture host cleanup failed: ${JSON.stringify(result)}`);
+              settled = true; clearTimeout(timer); child.stdin.end();
+              return;
+            }
             if (result.type !== 'line-visibility' || result.visible !== false || result.verified !== true) throw new Error('Owned fixture hide/readback failed');
             return send('line-show');
           }).then(result => {
@@ -113,6 +132,8 @@ async function run() {
     if (!settled || (code !== 0 && !(forceNoFit && code === 1))) { fail(new Error(`native helper exited before clean completion (${code})`)); return; }
     window.destroy(); console.log(forceNoFit
       ? 'PASS: ProductBrokerFixture rejected no-fit attachment and verified rollback; no LINE process used.'
+      : layoutBoundary
+        ? `PASS: ProductBrokerFixture ${layoutBoundary} actual-outer-width layout and restoration; no LINE process used.`
       : 'PASS: ProductBrokerFixture attach/show/hide/native restore-button retry/detach readbacks and working-area containment; no LINE process used.'); app.exit(0);
   });
   timer = setTimeout(() => fail(new Error('owned fixture lifecycle timed out')), 30000);

@@ -58,6 +58,7 @@ internal static class HubBroker {
   static string hubDpiBefore,hubDpiAfter,fixtureDpiBefore,fixtureDpiAfter,hubDpiRestored,fixtureDpiRestored;
   static readonly List<object> layoutObservations=new List<object>();
   static bool layoutAdapted;
+  static bool layoutInProgress;
   static int hubMinimumWidth,hubMinimumHeight;
   static Rect LocalBounds(IntPtr window) { Rect rect;if(!GetWindowRect(window,out rect))throw new Exception("Cannot read child bounds");MapWindowPoints(IntPtr.Zero,pane.Handle,ref rect,2);return rect; }
   static Rect WindowBounds(IntPtr window) { Rect rect;if(!GetWindowRect(window,out rect))throw new Exception("Cannot read native window bounds");return rect; }
@@ -106,6 +107,11 @@ internal static class HubBroker {
   }
   static Placement PlacementOf(IntPtr hwnd) { var p=new Placement { Length=Marshal.SizeOf(typeof(Placement)) }; if(!GetWindowPlacement(hwnd,ref p))throw new Exception("Cannot save fixture placement"); return p; }
   static void Layout() {
+    if(layoutInProgress)return;
+    layoutInProgress=true;
+    try { LayoutCore(); } finally { layoutInProgress=false; }
+  }
+  static void LayoutCore() {
 #if LINE_STUDY
     if(chatRestored)return;
 #endif
@@ -140,9 +146,21 @@ internal static class HubBroker {
       // clipped overflow is accepted merely because Windows hides it.
       if(h.Left==0&&h.Top==0&&observed.Top==0&&h.Right==observed.Left&&observed.Right==width&&h.Bottom==height&&observed.Bottom==height) { if(attempt>0)layoutAdapted=true;return; }
       int actualChat=observed.Right-observed.Left,actualHub=h.Right-h.Left;
-      if(actualHub>left && actualHub+actualChat>width)throw new Exception("Native child minimum widths cannot fit side by side");
       if(actualChat!=chatWidth)chatWidth=actualChat;
-      else if(actualHub>left)chatWidth=width-actualHub;
+      int requiredChildWidth=Math.Max(hubMinimumWidth,actualHub)+actualChat;
+      if(requiredChildWidth>width) {
+        int growth=requiredChildWidth-width;
+        int requiredRootWidth=checked(root.Width+growth);
+        if(requiredRootWidth>rootWorkingArea.Width)throw new Exception("Native child minimum widths cannot fit within the selected display working area");
+        root.MinimumSize=new Size(Math.Max(root.MinimumSize.Width,requiredRootWidth),root.MinimumSize.Height);
+        root.Width=requiredRootWidth;
+        root.Location=new Point(rootWorkingArea.Left+Math.Max(0,(rootWorkingArea.Width-root.Width)/2),rootWorkingArea.Top+Math.Max(0,(rootWorkingArea.Height-root.Height)/2));
+        root.PerformLayout();
+        GetClientRect(pane.Handle,out r);width=r.Right-r.Left;height=r.Bottom-r.Top;
+        if(width<requiredChildWidth||height<hubMinimumHeight)throw new Exception("Native root could not provide actual child outer minimum dimensions within the selected display working area");
+        continue;
+      }
+      if(actualHub>left)chatWidth=width-actualHub;
     }
     throw new Exception("Native layout did not converge within three read-back attempts");
   }
@@ -243,7 +261,11 @@ internal static class HubBroker {
       if(fixtureDpiAfter!="context-4" || GetParent(chat)!=pane.Handle || GetAncestor(chat,2)!=root.Handle)throw new Exception("LINE native parent or DPI verification failed");
       lineAttached=true;lineVisible=true;Layout();ShowWindow(chat,5);SetFocus(chat);Trace("product show visible="+IsWindowVisible(chat)+" root="+IsWindowVisible(root.Handle)+" pane="+IsWindowVisible(pane.Handle));
       if(!LayoutProductVerified())throw new Exception("LINE side-by-side layout read-back failed");
+#if LINE_PRODUCT_FIXTURE
+      Emit("line-attached","attached",true,"alive",LineAlive,"layoutAdapted",layoutAdapted,"layoutObservations",layoutObservations,"root",BoundsRecord(WindowBounds(root.Handle)),"workingArea",new { left=rootWorkingArea.Left,top=rootWorkingArea.Top,width=rootWorkingArea.Width,height=rootWorkingArea.Height });
+#else
       Emit("line-attached","attached",true,"alive",LineAlive);
+#endif
     } catch(Exception ex) {
       Trace("LINE attach rejected: "+ex.Message);
       try { RestoreFixture(); } catch {}
@@ -390,11 +412,23 @@ internal static class HubBroker {
       if(hubMinimumWidth<1||hubMinimumWidth>8192||hubMinimumHeight<1||hubMinimumHeight>8192)throw new Exception("Hub minima outside bounded range");
 #if LINE_PRODUCT
       root.PerformLayout();
-      int productMinimumWidth=checked(hubMinimumWidth+360+(root.Width-root.ClientSize.Width));
+      int rootFrameWidth=root.Width-root.ClientSize.Width;
+      int hubMinimumRootWidth=checked(hubMinimumWidth+rootFrameWidth);
+      int productMinimumWidthEstimate=checked(hubMinimumRootWidth+360);
       int productMinimumHeight=checked(hubMinimumHeight+(root.Height-pane.ClientSize.Height));
-      if(productMinimumWidth>rootWorkingArea.Width||productMinimumHeight>rootWorkingArea.Height)throw new Exception("Native root minimum dimensions exceed the selected display working area; attachment refused");
-      root.MinimumSize=new Size(productMinimumWidth,productMinimumHeight);
-      root.Size=new Size(Math.Max(root.Width,productMinimumWidth),Math.Max(root.Height,productMinimumHeight));
+#if LINE_PRODUCT_FIXTURE
+      string fixtureBoundary=Environment.GetEnvironmentVariable("CROSSCHAT_BROKER_FIXTURE_LAYOUT_BOUNDARY");
+      if(fixtureBoundary=="exact-fit"||fixtureBoundary=="one-pixel-short") {
+        rootWorkingArea=new Rectangle(rootWorkingArea.Left,rootWorkingArea.Top,checked(hubMinimumRootWidth+(fixtureBoundary=="exact-fit"?364:363)),rootWorkingArea.Height);
+        root.MaximumSize=rootWorkingArea.Size;
+        root.Width=productMinimumWidthEstimate;
+        root.Location=new Point(rootWorkingArea.Left+Math.Max(0,(rootWorkingArea.Width-root.Width)/2),rootWorkingArea.Top+Math.Max(0,(rootWorkingArea.Height-root.Height)/2));
+      }
+#endif
+      if(hubMinimumRootWidth>rootWorkingArea.Width||productMinimumHeight>rootWorkingArea.Height)throw new Exception("Native Hub minimum dimensions exceed the selected display working area; attachment refused");
+      root.MinimumSize=new Size(hubMinimumRootWidth,productMinimumHeight);
+      root.Width=Math.Max(Math.Min(root.Width,rootWorkingArea.Width),Math.Min(productMinimumWidthEstimate,rootWorkingArea.Width));
+      root.Height=Math.Max(root.Height,productMinimumHeight);
       if(root.Width>rootWorkingArea.Width||root.Height>rootWorkingArea.Height)throw new Exception("Native root minimum dimensions exceed the selected display working area; attachment refused");
       root.Location=new Point(rootWorkingArea.Left+Math.Max(0,(rootWorkingArea.Width-root.Width)/2),rootWorkingArea.Top+Math.Max(0,(rootWorkingArea.Height-root.Height)/2));
 #endif
