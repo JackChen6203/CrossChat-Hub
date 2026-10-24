@@ -43,7 +43,7 @@ internal static class HubBroker {
   static readonly List<string> rollbackOrder=new List<string>();
   static Form root; static Panel pane; static Label status;
 #if LINE_PRODUCT
-  static Button lineRecoveryButton;
+  static Button lineRecoveryButton, restoreLineButton;
 #endif
   static bool attached, finish, closingRequested, resized, rootSurvived, chatSurvived, chatRestored, chatClosed, controllerExited, dpiEqual;
 #if LINE_PRODUCT
@@ -54,11 +54,13 @@ internal static class HubBroker {
 #endif
   static string error;
   static bool mixed; static int previousHosting=-1, rootHosting=-1,paneHosting=-1;
+  static Rectangle rootWorkingArea;
   static string hubDpiBefore,hubDpiAfter,fixtureDpiBefore,fixtureDpiAfter,hubDpiRestored,fixtureDpiRestored;
   static readonly List<object> layoutObservations=new List<object>();
   static bool layoutAdapted;
   static int hubMinimumWidth,hubMinimumHeight;
   static Rect LocalBounds(IntPtr window) { Rect rect;if(!GetWindowRect(window,out rect))throw new Exception("Cannot read child bounds");MapWindowPoints(IntPtr.Zero,pane.Handle,ref rect,2);return rect; }
+  static Rect WindowBounds(IntPtr window) { Rect rect;if(!GetWindowRect(window,out rect))throw new Exception("Cannot read native window bounds");return rect; }
   static object BoundsRecord(Rect r) {return new { left=r.Left,top=r.Top,width=r.Right-r.Left,height=r.Bottom-r.Top };}
 #if LINE_STUDY || LINE_PRODUCT
   static readonly Stopwatch lineDeadline=new Stopwatch();
@@ -86,6 +88,7 @@ internal static class HubBroker {
   static long lastSequence, currentSequence;
   static void RequestHostClose() {
     if(closeRequestInFlight)return;
+    if(!attached||finish)return;
     closeRequestInFlight=true;closingRequested=true;Emit("close-request");
   }
 #endif
@@ -307,6 +310,7 @@ internal static class HubBroker {
   }
 #endif
   static void Save() {
+    Rect rootRect=new Rect(),paneRect=new Rect();if(root!=null&&root.IsHandleCreated)GetWindowRect(root.Handle,out rootRect);if(pane!=null&&pane.IsHandleCreated)GetWindowRect(pane.Handle,out paneRect);
     File.WriteAllText(resultPath,new JavaScriptSerializer { MaxJsonLength=65536,RecursionLimit=8 }.Serialize(new Dictionary<string,object> {
       {"attached",attached},{"sameRootAtAttach",attached},{"dpiAwarenessEqual",dpiEqual},{"resizeVerified",resized},
       {"controllerExited",controllerExited},{"brokerRootSurvived",rootSurvived},{"fixtureHwndSurvived",chatSurvived},
@@ -314,6 +318,9 @@ internal static class HubBroker {
       ,{"injection",injection},{"hubChanged",hubChanged},{"fixtureChanged",chatChanged},{"rollbackAttempted",rollbackAttempted},
       {"hubRestoreVerified",hubRestored},{"hubAliveAtRollback",hubRestored&&Alive(controller,controllerStart,hub)},
       {"layoutObservations",layoutObservations},{"layoutAdapted",layoutAdapted},
+#if LINE_PRODUCT
+      {"layoutReport",new { root=BoundsRecord(rootRect),pane=BoundsRecord(paneRect),workingArea=new { left=rootWorkingArea.Left,top=rootWorkingArea.Top,width=rootWorkingArea.Width,height=rootWorkingArea.Height } }},
+#endif
       {"hubMinimumWidth",hubMinimumWidth},{"hubMinimumHeight",hubMinimumHeight},
       {"rollbackVerified",rollbackVerified},{"rollbackOrder",rollbackOrder},
 #if LINE_STUDY
@@ -383,10 +390,13 @@ internal static class HubBroker {
       if(hubMinimumWidth<1||hubMinimumWidth>8192||hubMinimumHeight<1||hubMinimumHeight>8192)throw new Exception("Hub minima outside bounded range");
 #if LINE_PRODUCT
       root.PerformLayout();
-      int productMinimumWidth=checked(hubMinimumWidth*2+(root.Width-root.ClientSize.Width));
+      int productMinimumWidth=checked(hubMinimumWidth+360+(root.Width-root.ClientSize.Width));
       int productMinimumHeight=checked(hubMinimumHeight+(root.Height-pane.ClientSize.Height));
+      if(productMinimumWidth>rootWorkingArea.Width||productMinimumHeight>rootWorkingArea.Height)throw new Exception("Native root minimum dimensions exceed the selected display working area; attachment refused");
       root.MinimumSize=new Size(productMinimumWidth,productMinimumHeight);
-      if(root.Width<productMinimumWidth||root.Height<productMinimumHeight)root.Size=new Size(Math.Max(root.Width,productMinimumWidth),Math.Max(root.Height,productMinimumHeight));
+      root.Size=new Size(Math.Max(root.Width,productMinimumWidth),Math.Max(root.Height,productMinimumHeight));
+      if(root.Width>rootWorkingArea.Width||root.Height>rootWorkingArea.Height)throw new Exception("Native root minimum dimensions exceed the selected display working area; attachment refused");
+      root.Location=new Point(rootWorkingArea.Left+Math.Max(0,(rootWorkingArea.Width-root.Width)/2),rootWorkingArea.Top+Math.Max(0,(rootWorkingArea.Height-root.Height)/2));
 #endif
       long raw; if(!long.TryParse((string)d["hwnd"],out raw)||raw<=0)throw new Exception("Invalid HWND"); hub=new IntPtr(raw);
       if(!Alive(controller,controllerStart,hub)||GetParent(hub)!=IntPtr.Zero)throw new Exception("Hub HWND ownership/root mismatch");
@@ -429,7 +439,11 @@ internal static class HubBroker {
 #else
       if(GetParent(hub)!=pane.Handle || GetAncestor(hub,2)!=root.Handle)throw new Exception("Hub broker root verification failed");
 #endif
-      attached=true; Layout(); Inject("after-resize"); status.Text=
+      attached=true;
+#if LINE_PRODUCT
+      restoreLineButton.Enabled=true;
+#endif
+      Layout(); Inject("after-resize"); status.Text=
 #if LINE_STUDY
       "Real LINE window temporarily embedded. Automatic detach within 20 seconds; no messaging operations.";
 #elif LINE_PRODUCT
@@ -437,7 +451,12 @@ internal static class HubBroker {
 #else
       "Isolated actual Hub + owned synthetic chat. No LINE account attached.";
 #endif
-      Trace("attached root="+root.Handle+" brokerPid="+Process.GetCurrentProcess().Id+(fixture==null?"":" fixturePid="+fixture.Id)); Emit("attached","rootHwnd",root.Handle.ToInt64().ToString()); Save();
+      Trace("attached root="+root.Handle+" brokerPid="+Process.GetCurrentProcess().Id+(fixture==null?"":" fixturePid="+fixture.Id)); Save();
+#if LINE_PRODUCT
+      Emit("attached","rootHwnd",root.Handle.ToInt64().ToString(),"layoutReport",new { root=BoundsRecord(WindowBounds(root.Handle)),pane=BoundsRecord(WindowBounds(pane.Handle)),workingArea=new { left=rootWorkingArea.Left,top=rootWorkingArea.Top,width=rootWorkingArea.Width,height=rootWorkingArea.Height } });
+#else
+      Emit("attached","rootHwnd",root.Handle.ToInt64().ToString());
+#endif
     } else if(type=="shutdown" && d.Count==
 #if LINE_PRODUCT
       4
@@ -462,6 +481,7 @@ internal static class HubBroker {
     else if(type=="close-request-cancel"&&d.Count==4) { closeRequestInFlight=false;closingRequested=false;Emit("close-request-cancelled","released",true); }
 #if LINE_PRODUCT_FIXTURE
     else if(type=="fixture-root-close"&&d.Count==4) { root.Close();root.Close();Emit("fixture-root-close","accepted",true); }
+    else if(type=="fixture-click-restore-button"&&d.Count==4) { restoreLineButton.PerformClick();Emit("fixture-restore-button","accepted",true); }
     else if(type=="fixture-fail-next-restore"&&d.Count==4) { failNextFixtureRestore=true;Emit("fixture-fail-next-restore","accepted",true); }
 #endif
 #endif
@@ -508,13 +528,18 @@ internal static class HubBroker {
     if(mixed) { try { previousHosting=SetThreadDpiHostingBehavior(1); }catch(EntryPointNotFoundException){return 3;} if(previousHosting==-1)return 3; }
     AppDomain.CurrentDomain.UnhandledException+=delegate(object s,UnhandledExceptionEventArgs e){Trace("unhandled "+e.ExceptionObject);};
     Trace("start brokerPid="+Process.GetCurrentProcess().Id+" controller="+pid);
+    IntPtr controllerWindow=controller.MainWindowHandle;
+    if(controllerWindow==IntPtr.Zero)return 4;
+    var targetScreen=Screen.FromHandle(controllerWindow);rootWorkingArea=targetScreen.WorkingArea;
     root=new Form { Text=
 #if LINE_PRODUCT
       "CrossChat Hub — native LINE host",
 #else
       "CrossChat broker — isolated actual Hub study",
 #endif
-      Width=1660,Height=900,MinimumSize=new Size(1400,700),StartPosition=FormStartPosition.CenterScreen };
+      Width=Math.Min(1660,rootWorkingArea.Width),Height=Math.Min(900,rootWorkingArea.Height),StartPosition=FormStartPosition.Manual };
+    root.MaximumSize=rootWorkingArea.Size;
+    root.Location=new Point(rootWorkingArea.Left+Math.Max(0,(rootWorkingArea.Width-root.Width)/2),rootWorkingArea.Top+Math.Max(0,(rootWorkingArea.Height-root.Height)/2));
     status=new Label { Dock=DockStyle.Top,Height=34,Text="Waiting for isolated Hub handshake",Padding=new Padding(6) };
     var toolbar=new FlowLayoutPanel { Dock=DockStyle.Top,Height=36 };
     var focusHub=new Button { Text="Focus Hub",Width=120 }; focusHub.Click+=delegate { if(attached&&!finish)Emit("focus-hub"); };
@@ -526,6 +551,9 @@ internal static class HubBroker {
     root.Text="CrossChat broker — temporary LINE study";
 #endif
 #if LINE_PRODUCT
+    restoreLineButton=new Button { Text="還原 LINE",Width=130,Enabled=false };
+    restoreLineButton.Click+=delegate { RequestHostClose(); };
+    toolbar.Controls.Add(restoreLineButton);
     lineRecoveryButton=new Button { Text="Retry LINE restoration",Width=190,Visible=false };
     lineRecoveryButton.Click+=delegate {
       try { RestoreFixture(); } catch(Exception ex) { error="LINE recovery failed: "+ex.Message; }

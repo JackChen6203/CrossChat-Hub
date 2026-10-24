@@ -8,8 +8,9 @@ const os = require('node:os');
 const path = require('node:path');
 
 if (process.platform !== 'win32') throw new Error('Owned native broker smoke is Windows-only');
-const binary = path.join(__dirname, '..', 'build', 'bin', 'native-host', 'ProductBrokerFixture.exe');
+const binary = process.env.CROSSCHAT_PRODUCT_BROKER_FIXTURE || path.join(__dirname, '..', 'build', 'bin', 'native-host', 'ProductBrokerFixture.exe');
 if (!fs.existsSync(binary)) throw new Error('Build native helpers before running the owned fixture smoke');
+const forceNoFit = process.env.CROSSCHAT_FIXTURE_NO_FIT === '1';
 const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'crosschat-native-line-'));
 const nonce = crypto.randomBytes(24).toString('hex');
 let window, child, sequence = 0, output = '', settled = false, timer, closeRequestCount = 0;
@@ -54,9 +55,22 @@ async function run() {
       try { message = JSON.parse(line); } catch { fail(new Error('invalid broker JSON')); return; }
       if (message.v !== 1 || message.nonce !== nonce || !Number.isSafeInteger(message.sequence)) { fail(new Error('invalid broker envelope')); return; }
       if (message.type === 'ready') {
+        if (forceNoFit) {
+          void send('attach', { pid: process.pid, startTicks: message.startTicks, hwnd, hubMinimum: { width: 8192, height: 8192 } })
+            .then(result => {
+              if (result.type !== 'error' || !/working area; attachment refused/.test(result.message) || result.rollbackVerified !== true) throw new Error(`No-fit attach was not rejected and rolled back: ${JSON.stringify(result)}`);
+              settled = true; clearTimeout(timer); child.stdin.end();
+            }).catch(fail);
+          return;
+        }
         void send('attach', { pid: process.pid, startTicks: message.startTicks, hwnd, hubMinimum })
           .then(result => {
             if (result.type !== 'attached') throw new Error('Hub attach was not acknowledged');
+            const layout = result.layoutReport;
+            if (!layout || !layout.root || !layout.pane || !layout.workingArea) throw new Error('Safe root/pane/working-area geometry report is missing');
+            const inside = (r, bounds) => r.left >= bounds.left && r.top >= bounds.top && r.left + r.width <= bounds.left + bounds.width && r.top + r.height <= bounds.top + bounds.height;
+            if (!inside(layout.root, layout.workingArea) || !inside(layout.pane, layout.root)) throw new Error('Native root or pane is outside its verified working-area/root bounds');
+            if ('hwnd' in layout.root || 'title' in layout.root || 'text' in layout.root) throw new Error('Geometry report contains disallowed metadata');
             return send('line-attach', { fixture: true });
           }).then(result => {
             if (result.type !== 'line-attached' || result.attached !== true || result.alive !== true) throw new Error(`Owned fixture attach/readback failed: ${JSON.stringify(result)}`);
@@ -69,18 +83,18 @@ async function run() {
             return send('fixture-fail-next-restore');
           }).then(result => {
             if (result.type !== 'fixture-fail-next-restore' || result.accepted !== true) throw new Error('Owned fixture restore-failure setup failed');
-            return send('fixture-root-close');
+            return send('fixture-click-restore-button');
           }).then(result => {
-            if (result.type !== 'fixture-root-close' || result.accepted !== true || closeRequestCount !== 1) throw new Error('Repeated root close did not emit exactly one close-request');
+            if (result.type !== 'fixture-restore-button' || result.accepted !== true || closeRequestCount !== 1) throw new Error('Native restore button did not emit exactly one close-request');
             return send('detach-host');
           }).then(result => {
             if (result.type !== 'line-restore-failed' || result.restored !== false) throw new Error('Owned fixture restore-failure response was not retained for retry');
             return send('close-request-cancel');
           }).then(result => {
             if (result.type !== 'close-request-cancelled' || result.released !== true) throw new Error('Close-request retry release was not acknowledged');
-            return send('fixture-root-close');
+            return send('fixture-click-restore-button');
           }).then(result => {
-            if (result.type !== 'fixture-root-close' || result.accepted !== true || closeRequestCount !== 2) throw new Error('Root close retry did not emit one new close-request');
+            if (result.type !== 'fixture-restore-button' || result.accepted !== true || closeRequestCount !== 2) throw new Error('Native restore button retry did not emit one new close-request');
             return send('detach-host');
           }).then(result => {
             if (result.type !== 'host-detached' || result.restored !== true || result.lineAlive !== true) throw new Error('Owned fixture normal detach/readback failed');
@@ -96,8 +110,10 @@ async function run() {
   });
   child.once('error', fail);
   child.once('exit', code => {
-    if (!settled || code !== 0) { fail(new Error(`native helper exited before clean completion (${code})`)); return; }
-    window.destroy(); console.log('PASS: ProductBrokerFixture attach/show/hide/root-close/retry/detach readbacks; no LINE process used.'); app.exit(0);
+    if (!settled || (code !== 0 && !(forceNoFit && code === 1))) { fail(new Error(`native helper exited before clean completion (${code})`)); return; }
+    window.destroy(); console.log(forceNoFit
+      ? 'PASS: ProductBrokerFixture rejected no-fit attachment and verified rollback; no LINE process used.'
+      : 'PASS: ProductBrokerFixture attach/show/hide/native restore-button retry/detach readbacks and working-area containment; no LINE process used.'); app.exit(0);
   });
   timer = setTimeout(() => fail(new Error('owned fixture lifecycle timed out')), 30000);
 }
